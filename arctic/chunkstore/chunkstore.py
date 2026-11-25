@@ -265,13 +265,12 @@ class ChunkStore(object):
                             (START, pymongo.ASCENDING),
                             (SEGMENT, pymongo.ASCENDING)]
         segment_cursor = self._collection.find(spec, sort=by_start_segment)
+        mdata_by_chunk = {(m[SYMBOL], m[START], m[END]): m for m in self._mdata.find(spec)}
 
         chunks = defaultdict(list)
         for _, segments in groupby(segment_cursor, key=lambda x: (x[START], x[SYMBOL])):
             segments = list(segments)
-            mdata = self._mdata.find_one({SYMBOL: segments[0][SYMBOL],
-                                          START: segments[0][START],
-                                          END: segments[0][END]})
+            mdata = mdata_by_chunk.get((segments[0][SYMBOL], segments[0][START], segments[0][END]))
 
             # when len(segments) == 1, this is essentially a no-op
             # otherwise, take all segments and reassemble the data to one chunk
