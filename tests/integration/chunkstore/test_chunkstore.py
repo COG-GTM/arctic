@@ -5,6 +5,7 @@ from datetime import datetime as dt
 import numpy as np
 import pandas as pd
 import pymongo
+from pymongo.errors import DocumentTooLarge
 import pytest
 from pandas import DataFrame, MultiIndex, Index, Series
 from pandas.testing import assert_frame_equal, assert_series_equal
@@ -660,6 +661,51 @@ def test_read_chunk_range(chunkstore_lib):
 
     df2 = chunkstore_lib.read('test', chunk_range=DateRange(None, None))
     assert_frame_equal_(df, df2)
+
+
+def test_read_metadata_in_batches(chunkstore_lib, monkeypatch):
+    monkeypatch.setattr('arctic.chunkstore.chunkstore.METADATA_BATCH_SIZE', 2)
+    df = DataFrame(data={'data': np.arange(7)},
+                   index=Index(pd.date_range('2016-01-01', periods=7, freq='D'), name='date'))
+    chunkstore_lib.write('a', df, chunk_size='D')
+    chunkstore_lib.write('b', df * 2, chunk_size='D')
+
+    specs = []
+    find = chunkstore_lib._mdata.find
+
+    def recording_find(spec, *args, **kwargs):
+        specs.append(spec)
+        return find(spec, *args, **kwargs)
+    monkeypatch.setattr(chunkstore_lib._mdata, 'find', recording_find)
+
+    assert_frame_equal_(chunkstore_lib.read('a'), df, check_freq=False)
+    assert len(specs) == 4
+    assert all('$or' in spec for spec in specs)
+    ret = chunkstore_lib.read(['a', 'b'], chunk_range=DateRange(dt(2016, 1, 2), dt(2016, 1, 6)))
+    assert_frame_equal_(ret['a'], df.iloc[1:6], check_freq=False)
+    assert_frame_equal_(ret['b'], df.iloc[1:6] * 2, check_freq=False)
+
+
+def test_read_metadata_falls_back_per_chunk(chunkstore_lib, monkeypatch):
+    df = DataFrame(data={'data': np.arange(3)},
+                   index=Index(pd.date_range('2016-01-01', periods=3, freq='D'), name='date'))
+    chunkstore_lib.write('a', df, chunk_size='D')
+
+    monkeypatch.setattr('arctic.chunkstore.chunkstore._chunk_key', lambda *args: object())
+    assert_frame_equal_(chunkstore_lib.read('a'), df, check_freq=False)
+
+    find = chunkstore_lib._mdata.find
+
+    batched = []
+
+    def too_large(spec, *args, **kwargs):
+        if '$or' in spec:
+            batched.append(spec)
+            raise DocumentTooLarge()
+        return find(spec, *args, **kwargs)
+    monkeypatch.setattr(chunkstore_lib._mdata, 'find', too_large)
+    assert_frame_equal_(chunkstore_lib.read('a'), df, check_freq=False)
+    assert len(batched) == 1
 
 
 def test_read_data_doesnt_exist(chunkstore_lib):

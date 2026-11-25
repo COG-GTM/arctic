@@ -6,7 +6,7 @@ from itertools import groupby
 import pymongo
 from bson.binary import Binary
 from pandas import DataFrame, Series
-from pymongo.errors import OperationFailure
+from pymongo.errors import DocumentTooLarge, OperationFailure
 
 from .date_chunker import DateChunker, START, END
 from .passthrough_chunker import PassthroughChunker
@@ -30,6 +30,12 @@ CHUNKER = 'ch'
 USERMETA = 'u'
 
 MAX_CHUNK_SIZE = 15 * 1024 * 1024
+METADATA_BATCH_SIZE = 1000
+
+
+def _chunk_key(symbol, start, end):
+    return symbol, repr(start), repr(end)
+
 
 SER_MAP = {FrametoArraySerializer.TYPE: FrametoArraySerializer()}
 
@@ -267,16 +273,18 @@ class ChunkStore(object):
         segment_cursor = self._collection.find(spec, sort=by_start_segment)
 
         chunks = defaultdict(list)
+        pending = []
         for _, segments in groupby(segment_cursor, key=lambda x: (x[START], x[SYMBOL])):
             segments = list(segments)
-            mdata = self._mdata.find_one({SYMBOL: segments[0][SYMBOL],
-                                          START: segments[0][START],
-                                          END: segments[0][END]})
-
             # when len(segments) == 1, this is essentially a no-op
             # otherwise, take all segments and reassemble the data to one chunk
-            chunk_data = b''.join([doc[DATA] for doc in segments])
-            chunks[segments[0][SYMBOL]].append({DATA: chunk_data, METADATA: mdata})
+            pending.append((segments[0][SYMBOL], segments[0][START], segments[0][END],
+                            b''.join([doc[DATA] for doc in segments])))
+            if len(pending) >= METADATA_BATCH_SIZE:
+                self._add_chunks(chunks, pending)
+                pending = []
+        if pending:
+            self._add_chunks(chunks, pending)
 
         skip_filter = not filter_data or chunk_range is None
 
@@ -284,6 +292,23 @@ class ChunkStore(object):
             return {sym: deser(chunks[sym], **kwargs) if skip_filter else chunker.filter(deser(chunks[sym], **kwargs), chunk_range) for sym in symbol}
         else:
             return deser(chunks[symbol[0]], **kwargs) if skip_filter else chunker.filter(deser(chunks[symbol[0]], **kwargs), chunk_range)
+
+    def _add_chunks(self, chunks, pending):
+        """
+        Fetch the metadata of already-read (symbol, start, end, data) chunks
+        in one query and append each chunk to chunks[symbol], in order.
+        """
+        query = {'$or': [{SYMBOL: sym, START: start, END: end} for sym, start, end, _ in pending]}
+        try:
+            mdata = {_chunk_key(m[SYMBOL], m[START], m[END]): m
+                     for m in self._mdata.find(query, batch_size=len(pending) + 1)}
+        except DocumentTooLarge:
+            mdata = {}
+        for sym, start, end, data in pending:
+            md = mdata.get(_chunk_key(sym, start, end))
+            if md is None:
+                md = self._mdata.find_one({SYMBOL: sym, START: start, END: end})
+            chunks[sym].append({DATA: data, METADATA: md})
 
     def read_audit_log(self, symbol=None):
         """
