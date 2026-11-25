@@ -32,6 +32,11 @@ USERMETA = 'u'
 MAX_CHUNK_SIZE = 15 * 1024 * 1024
 METADATA_BATCH_SIZE = 1000
 
+
+def _chunk_key(symbol, start, end):
+    return symbol, repr(start), repr(end)
+
+
 SER_MAP = {FrametoArraySerializer.TYPE: FrametoArraySerializer()}
 
 CHUNKER_MAP = {DateChunker.TYPE: DateChunker(),
@@ -270,7 +275,11 @@ class ChunkStore(object):
         chunks = defaultdict(list)
         pending = []
         for _, segments in groupby(segment_cursor, key=lambda x: (x[START], x[SYMBOL])):
-            pending.append(list(segments))
+            segments = list(segments)
+            # when len(segments) == 1, this is essentially a no-op
+            # otherwise, take all segments and reassemble the data to one chunk
+            pending.append((segments[0][SYMBOL], segments[0][START], segments[0][END],
+                            b''.join([doc[DATA] for doc in segments])))
             if len(pending) >= METADATA_BATCH_SIZE:
                 self._add_chunks(chunks, pending)
                 pending = []
@@ -284,21 +293,16 @@ class ChunkStore(object):
         else:
             return deser(chunks[symbol[0]], **kwargs) if skip_filter else chunker.filter(deser(chunks[symbol[0]], **kwargs), chunk_range)
 
-    def _add_chunks(self, chunks, segment_groups):
+    def _add_chunks(self, chunks, pending):
         """
-        Fetch the metadata for already-read groups of segments in one query
-        and append each reassembled chunk to chunks[symbol], in order.
+        Fetch the metadata of already-read (symbol, start, end, data) chunks
+        in one query and append each chunk to chunks[symbol], in order.
         """
-        mdata = {(m[SYMBOL], m[START], m[END]): m for m in
-                 self._mdata.find({SYMBOL: {'$in': list({g[0][SYMBOL] for g in segment_groups})},
-                                   START: {'$in': list({g[0][START] for g in segment_groups})}},
-                                  batch_size=len(segment_groups))}
-        for segments in segment_groups:
-            # when len(segments) == 1, this is essentially a no-op
-            # otherwise, take all segments and reassemble the data to one chunk
-            chunk_data = b''.join([doc[DATA] for doc in segments])
-            chunks[segments[0][SYMBOL]].append({DATA: chunk_data,
-                                                METADATA: mdata.get((segments[0][SYMBOL], segments[0][START], segments[0][END]))})
+        query = {'$or': [{SYMBOL: sym, START: start, END: end} for sym, start, end, _ in pending]}
+        mdata = {_chunk_key(m[SYMBOL], m[START], m[END]): m
+                 for m in self._mdata.find(query, batch_size=len(pending) + 1)}
+        for sym, start, end, data in pending:
+            chunks[sym].append({DATA: data, METADATA: mdata.get(_chunk_key(sym, start, end))})
 
     def read_audit_log(self, symbol=None):
         """
