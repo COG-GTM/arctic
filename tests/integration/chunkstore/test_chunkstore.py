@@ -662,6 +662,19 @@ def test_read_chunk_range(chunkstore_lib):
     assert_frame_equal_(df, df2)
 
 
+def test_read_metadata_in_batches(chunkstore_lib, monkeypatch):
+    monkeypatch.setattr('arctic.chunkstore.chunkstore.METADATA_BATCH_SIZE', 2)
+    df = DataFrame(data={'data': np.arange(7)},
+                   index=Index(pd.date_range('2016-01-01', periods=7, freq='D'), name='date'))
+    chunkstore_lib.write('a', df, chunk_size='D')
+    chunkstore_lib.write('b', df * 2, chunk_size='D')
+
+    assert_frame_equal_(chunkstore_lib.read('a'), df, check_freq=False)
+    ret = chunkstore_lib.read(['a', 'b'], chunk_range=DateRange(dt(2016, 1, 2), dt(2016, 1, 6)))
+    assert_frame_equal_(ret['a'], df.iloc[1:6], check_freq=False)
+    assert_frame_equal_(ret['b'], df.iloc[1:6] * 2, check_freq=False)
+
+
 def test_read_data_doesnt_exist(chunkstore_lib):
     with pytest.raises(NoDataFoundException) as e:
         chunkstore_lib.read('some_data')

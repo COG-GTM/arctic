@@ -30,6 +30,7 @@ CHUNKER = 'ch'
 USERMETA = 'u'
 
 MAX_CHUNK_SIZE = 15 * 1024 * 1024
+METADATA_BATCH_SIZE = 1000
 
 SER_MAP = {FrametoArraySerializer.TYPE: FrametoArraySerializer()}
 
@@ -265,17 +266,16 @@ class ChunkStore(object):
                             (START, pymongo.ASCENDING),
                             (SEGMENT, pymongo.ASCENDING)]
         segment_cursor = self._collection.find(spec, sort=by_start_segment)
-        mdata_by_chunk = {(m[SYMBOL], m[START], m[END]): m for m in self._mdata.find(spec)}
 
         chunks = defaultdict(list)
+        pending = []
         for _, segments in groupby(segment_cursor, key=lambda x: (x[START], x[SYMBOL])):
-            segments = list(segments)
-            mdata = mdata_by_chunk.get((segments[0][SYMBOL], segments[0][START], segments[0][END]))
-
-            # when len(segments) == 1, this is essentially a no-op
-            # otherwise, take all segments and reassemble the data to one chunk
-            chunk_data = b''.join([doc[DATA] for doc in segments])
-            chunks[segments[0][SYMBOL]].append({DATA: chunk_data, METADATA: mdata})
+            pending.append(list(segments))
+            if len(pending) >= METADATA_BATCH_SIZE:
+                self._add_chunks(chunks, pending)
+                pending = []
+        if pending:
+            self._add_chunks(chunks, pending)
 
         skip_filter = not filter_data or chunk_range is None
 
@@ -283,6 +283,22 @@ class ChunkStore(object):
             return {sym: deser(chunks[sym], **kwargs) if skip_filter else chunker.filter(deser(chunks[sym], **kwargs), chunk_range) for sym in symbol}
         else:
             return deser(chunks[symbol[0]], **kwargs) if skip_filter else chunker.filter(deser(chunks[symbol[0]], **kwargs), chunk_range)
+
+    def _add_chunks(self, chunks, segment_groups):
+        """
+        Fetch the metadata for already-read groups of segments in one query
+        and append each reassembled chunk to chunks[symbol], in order.
+        """
+        mdata = {(m[SYMBOL], m[START], m[END]): m for m in
+                 self._mdata.find({SYMBOL: {'$in': list({g[0][SYMBOL] for g in segment_groups})},
+                                   START: {'$in': list({g[0][START] for g in segment_groups})}},
+                                  batch_size=len(segment_groups))}
+        for segments in segment_groups:
+            # when len(segments) == 1, this is essentially a no-op
+            # otherwise, take all segments and reassemble the data to one chunk
+            chunk_data = b''.join([doc[DATA] for doc in segments])
+            chunks[segments[0][SYMBOL]].append({DATA: chunk_data,
+                                                METADATA: mdata.get((segments[0][SYMBOL], segments[0][START], segments[0][END]))})
 
     def read_audit_log(self, symbol=None):
         """
