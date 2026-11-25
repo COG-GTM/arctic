@@ -6,7 +6,7 @@ from itertools import groupby
 import pymongo
 from bson.binary import Binary
 from pandas import DataFrame, Series
-from pymongo.errors import OperationFailure
+from pymongo.errors import DocumentTooLarge, OperationFailure
 
 from .date_chunker import DateChunker, START, END
 from .passthrough_chunker import PassthroughChunker
@@ -299,10 +299,16 @@ class ChunkStore(object):
         in one query and append each chunk to chunks[symbol], in order.
         """
         query = {'$or': [{SYMBOL: sym, START: start, END: end} for sym, start, end, _ in pending]}
-        mdata = {_chunk_key(m[SYMBOL], m[START], m[END]): m
-                 for m in self._mdata.find(query, batch_size=len(pending) + 1)}
+        try:
+            mdata = {_chunk_key(m[SYMBOL], m[START], m[END]): m
+                     for m in self._mdata.find(query, batch_size=len(pending) + 1)}
+        except DocumentTooLarge:
+            mdata = {}
         for sym, start, end, data in pending:
-            chunks[sym].append({DATA: data, METADATA: mdata.get(_chunk_key(sym, start, end))})
+            md = mdata.get(_chunk_key(sym, start, end))
+            if md is None:
+                md = self._mdata.find_one({SYMBOL: sym, START: start, END: end})
+            chunks[sym].append({DATA: data, METADATA: md})
 
     def read_audit_log(self, symbol=None):
         """
